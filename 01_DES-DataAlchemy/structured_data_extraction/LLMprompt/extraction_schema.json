@@ -1,0 +1,90 @@
+{
+  "title": "Deep Eutectic Solvent Viscosity Extraction",
+  "description": "Schema for extracting DES composition, temperature, and viscosity data. Always expand chemical abbreviations into full names.",
+  "type": "object",
+  "properties": {
+    "article_title": {
+      "type": "string",
+      "nullable": true,
+      "description": "The full title of the scientific research paper."
+    },
+    "des_entries": {
+      "description": "An array of DES entries focused on composition, temperature, and viscosity.",
+      "x-alternativeNames": [
+        "Deep Eutectic Solvent Entries",
+        "DES Systems",
+        "Viscosity Data"
+      ],
+      "type": "array",
+      "items": {
+        "description": "A single DES entry with composition, temperature, and viscosity.",
+        "type": "object",
+        "properties": {
+          "components": {
+            "description": "Ordered list of chemical components. Always expand abbreviations into full chemical names.",
+            "x-alternativeNames": ["Chemical Components", "Constituents", "Ingredients"],
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "FULL chemical name of the component. MUST expand any abbreviation (e.g. convert 'ChCl' to 'Choline chloride', 'U' to 'Urea', 'EG' to 'Ethylene glycol', 'Gly' to 'Glycerol', 'LA' to 'Lactic acid'). Never output abbreviations in this field.",
+                  "x-alternativeNames": ["Full Chemical Name", "Chemical Name", "Full Name"],
+                  "type": "string"
+                },
+                "acronym": {
+                  "description": "Abbreviation or acronym exactly as written in the paper (e.g. 'ChCl', 'U', 'EG'). If no abbreviation appears, set to null.",
+                  "x-alternativeNames": ["Abbreviation", "Short Name", "Acronym"],
+                  "type": "string",
+                  "nullable": true
+                },
+                "composition": {
+                  "description": "Compositional value (usually the molar ratio coefficient, e.g. 1 or 2 in a 1:2 mixture).",
+                  "x-alternativeNames": ["Component Composition", "Amount", "Ratio"],
+                  "type": "number"
+                }
+              },
+              "required": ["name", "composition"]
+            }
+          },
+          "temperature": {
+            "description": "Experimental temperature at which the viscosity was measured.",
+            "x-alternativeNames": ["Measurement Temperature", "Experimental Temperature"],
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "value": {
+                "description": "Numerical value of the temperature.",
+                "type": "number"
+              },
+              "unit": {
+                "description": "Unit of the temperature (e.g. 'K', '°C', 'Celsius', 'Kelvin').",
+                "type": "string"
+              }
+            },
+            "required": ["value", "unit"]
+          },
+          "viscosity": {
+            "description": "Measured viscosity of the DES at the corresponding temperature.",
+            "x-alternativeNames": ["Dynamic Viscosity", "Viscosity Value"],
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "value": {
+                "description": "Numerical value of the viscosity.",
+                "type": "number"
+              },
+              "unit": {
+                "description": "Unit of the viscosity (e.g. 'mPa·s', 'cP', 'Pa·s').",
+                "type": "string"
+              }
+            },
+            "required": ["value", "unit"]
+          }
+        },
+        "required": ["components"]
+      }
+    }
+  },
+  "required": ["des_entries"]
+}
