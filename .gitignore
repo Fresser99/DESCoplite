@@ -40,3 +40,21 @@ artifacts/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 项目特定目录
+01_DES-DataAlchemy/dataset_pretreatment/tests/
+01_DES-DataAlchemy/dataset_pretreatment/data/
+01_DES-DataAlchemy/dataset_pretreatment/tmp_data/
+01_DES-DataAlchemy/structured_data_extraction/tests/
+01_DES-DataAlchemy/structured_data_extraction/data/
+01_DES-DataAlchemy/structured_data_extraction/tmp_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境变量
+.env
+
+AGENTS.MD

@@ -1,0 +1,476 @@
+import csv
+import json
+import logging
+import os
+import re
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from threading import Lock, Event
+from dataclasses import dataclass, field
+
+import httpx
+from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
+from app_configs import MainScreeningConfig
+
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# CSV 读写工具函数
+# ==========================================
+
+def read_csv_as_dict(csv_path):
+    """读取CSV文件，以第一列（文件名）为键，返回有序字典"""
+    records = OrderedDict()
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header:
+                for row in reader:
+                    if row:
+                        key = row[0]
+                        records[key] = row
+    return records
+
+
+def write_csv_from_dict(csv_path, records, header=None):
+    """将有序字典写回CSV文件"""
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        if header:
+            writer.writerow(header)
+        for row in records.values():
+            writer.writerow(row)
+
+
+# ==========================================
+# 多线程csv管理类
+# ==========================================
+
+class ThreadSafeCSVManager:
+
+    def __init__(self, csv_path: str, header: list[str]):
+        self.csv_path = csv_path
+        self.header = header
+        self._lock = Lock()
+
+        existing = read_csv_as_dict(csv_path)
+        self._records: OrderedDict = existing          
+        self.handled_set: set[str] = set(existing.keys())
+
+    def is_handled(self, key: str) -> bool:
+        return key in self.handled_set
+
+    def write_record(self, row: list) -> None:
+ 
+        key = row[0]
+        with self._lock:
+            is_new = key not in self._records
+            self._records[key] = row
+            self.handled_set.add(key)
+
+            if is_new:
+                self._append_to_file(row)
+                logger.debug(f"  CSV 已追加（append）: {key}")
+            else:
+                write_csv_from_dict(self.csv_path, self._records, header=self.header)
+                logger.debug(f"  CSV 已更新（upsert）: {key}")
+
+    def _append_to_file(self, row: list) -> None:
+
+        file_exists = (
+            os.path.exists(self.csv_path)
+            and os.path.getsize(self.csv_path) > 0
+        )
+        with open(self.csv_path, "a", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(self.header)
+            writer.writerow(row)
+
+
+@dataclass
+class ThreadSafeCounters:
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    skipped: int = 0
+    has_data: int = 0
+    no_data: int = 0
+    failed: int = 0
+
+    def increment(self, key: str) -> None:
+        with self._lock:
+            setattr(self, key, getattr(self, key) + 1)
+
+
+# ==========================================
+# 线程独立client
+# ==========================================
+
+def make_client(config: MainScreeningConfig) -> OpenAI:
+
+    http_client = httpx.Client(
+        proxy=None,
+        timeout=httpx.Timeout(config.timeout, connect=10.0),
+    )
+    return OpenAI(
+        api_key=config.api_key,
+        base_url=config.model_base_url,
+        http_client=http_client,
+    )
+
+
+# ==========================================
+# Prompt 与 LLM 交互
+# ==========================================
+
+def load_prompt_template(template_path):
+    """加载提示词模板文件"""
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"提示模板未找到: {template_path}")
+    with open(template_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+_RETRY_POLICY = dict(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(
+        (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+            RuntimeError,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+        )
+    ),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+
+
+@retry(**_RETRY_POLICY)
+def upload_file(client: OpenAI, file_path: str):
+    """上传 PDF 文件到百炼，返回 file_id（purpose=file-extract，解析免费）"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    logger.info(f"上传文件中: {os.path.basename(file_path)}")
+    file_object = client.files.create(
+        file=Path(file_path), purpose="file-extract"
+    )
+
+    if not file_object or not file_object.id:
+        raise RuntimeError(f"文件上传失败: {os.path.basename(file_path)}")
+
+    return file_object.id
+
+
+def wait_file_processed(client: OpenAI, file_id: str, timeout: float = 120.0) -> None:
+    """轮询文件解析状态，直到 processed；超时或解析失败则抛异常"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            file_obj = client.files.retrieve(file_id)
+        except Exception:
+            file_obj = None
+
+        status = getattr(file_obj, "status", None)
+        if status == "processed":
+            logger.debug(f"  文件解析完成: {file_id[:16]}...")
+            return
+        if status == "error":
+            raise RuntimeError(f"文件解析失败: {file_id[:16]}...")
+
+        time.sleep(2)
+
+    raise TimeoutError(f"文件解析超时 ({timeout}s): {file_id[:16]}...")
+
+
+def clean_response_text(text):
+    """清理 LLM 返回文本中的 <think> 标签和 Markdown 代码块标记"""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+    return text.strip()
+
+
+@retry(**_RETRY_POLICY)
+def run_workflow(client: OpenAI, file_id: str, prompt: str, config: MainScreeningConfig) -> str | None:
+    """通过 fileid:// 引用已上传文件，调用模型执行筛查任务"""
+    logger.info(f"  调用模型中 (file_id={file_id[:16]}..., timeout={config.timeout}s)")
+    completion = client.chat.completions.create(
+        model=config.model_name,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": f"fileid://{file_id}"},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    if not completion.choices:
+        logger.warning("API 返回空 choices")
+        return None
+
+    return completion.choices[0].message.content
+
+
+def delete_file(client: OpenAI, file_id: str) -> None:
+    """删除已上传的文件，释放服务端文件配额"""
+    try:
+        client.files.delete(file_id)
+        logger.debug(f"  已删除文件 file_id={file_id[:16]}...")
+    except Exception as e:
+        logger.warning(f"  删除文件失败 file_id={file_id[:16]}...: {e}")
+
+
+def cleanup_uploaded_files(client: OpenAI) -> int:
+    """清理服务端残留的已上传文件，返回删除数量"""
+    deleted = 0
+    try:
+        files = client.files.list()
+        file_list = getattr(files, "data", None) or []
+        for f in file_list:
+            fid = getattr(f, "id", None)
+            if not fid:
+                continue
+            try:
+                client.files.delete(fid)
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"  清理文件失败 {fid}: {e}")
+    except Exception as e:
+        logger.warning(f"  获取服务端文件列表失败: {e}")
+    return deleted
+
+
+# ==========================================
+# 结果判断
+# ==========================================
+
+NEGATIVE_KEYWORDS = {"NO", "无", "NONE", "NULL", "FALSE", "N/A"}
+POSITIVE_KEYWORDS = {"YES", "有", "TRUE"}
+
+
+def is_no_data(content):
+    """判断 LLM 返回内容是否表示'无数据'"""
+    if not content:
+        return True
+
+    content_stripped = content.strip()
+    content_upper = content_stripped.upper()
+
+    if content_upper in NEGATIVE_KEYWORDS:
+        return True
+    if content_upper in POSITIVE_KEYWORDS:
+        return False
+
+    try:
+        data = json.loads(content_stripped)
+        if isinstance(data, dict):
+            str_values = [
+                v.strip().upper() for v in data.values() if isinstance(v, str)
+            ]
+            if any(v in POSITIVE_KEYWORDS for v in str_values):
+                return False
+            if any(v in NEGATIVE_KEYWORDS for v in str_values):
+                return True
+    except json.JSONDecodeError:
+        pass
+
+    return False
+
+
+# ==========================================
+# 单文件处理任务
+# ==========================================
+
+def _process_single_task(
+    pdf_file: Path,
+    index: int,
+    total: int,
+    config: MainScreeningConfig,
+    prompt: str,
+    csv_manager: ThreadSafeCSVManager,
+    counters: ThreadSafeCounters,
+    skip_existing: bool,
+    stop_event: Event,
+) -> None:
+    
+    if stop_event.is_set():
+        return
+
+    filename = pdf_file.name
+    logger.info(f"[{index}/{total}] {filename}")
+
+    if skip_existing and csv_manager.is_handled(filename):
+        logger.info(f"  已处理，跳过")
+        counters.increment("skipped")
+        return
+
+    client = make_client(config)
+
+    has_data = "处理失败"
+    note = "未知错误"
+    raw_response = ""
+    file_id = None
+
+    try:
+        file_id = upload_file(client, str(pdf_file))
+        wait_file_processed(client, file_id)
+        result = run_workflow(client, file_id, prompt, config)
+
+        if not result:
+            has_data, note = "处理失败", "工作流执行失败"
+            counters.increment("failed")
+        else:
+            raw_response = result
+            result = clean_response_text(result)
+            logger.debug(f"  提取结果: {result[:200]}")
+
+            if is_no_data(result):
+                logger.info(f"  结果: 无相关数据")
+                has_data, note = "无", "无相关数据"
+                counters.increment("no_data")
+            else:
+                logger.info(f"  结果: 有相关数据")
+                has_data, note = "有", "有相关数据"
+                counters.increment("has_data")
+
+    except Exception as e:
+        logger.error(f"  处理异常: {e}", exc_info=True)
+        has_data, note = "处理失败", f"错误: {e}"
+        counters.increment("failed")
+    finally:
+        if file_id:
+            delete_file(client, file_id)
+
+    row = [
+        filename,
+        has_data,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        note,
+        raw_response,
+    ]
+    csv_manager.write_record(row)
+
+
+# ==========================================
+# 主处理流程
+# ==========================================
+
+def process_pdf_folder(config: MainScreeningConfig, skip_existing: bool = True) -> None:
+    """
+    遍历 PDF 文件夹，使用线程池并发上传并调用 Qwen Long 进行预筛选，
+    skip_existing: 是否跳过 CSV 中已有记录的文件，适合断点续跑。
+    """
+    csv_path = config.output_csv
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    prompt = load_prompt_template(config.prompt_templates_path)
+    if not prompt:
+        logger.error("prompt 模板为空，终止处理")
+        return
+
+    pdf_files = sorted(Path(config.pdf_input_folder).glob("*.pdf"))
+    if not pdf_files:
+        logger.warning(f"在文件夹 {config.pdf_input_folder} 中没有找到PDF文件")
+        return
+
+    total = len(pdf_files)
+    logger.info(f"找到 {total} 个PDF文件")
+
+    csv_headers = ["文件名", "数据状态", "处理时间", "备注", "LLM原始回复"]
+    csv_manager = ThreadSafeCSVManager(csv_path, csv_headers)
+    counters = ThreadSafeCounters()
+    stop_event = Event()
+
+    if csv_manager.handled_set:
+        logger.info(f"已有 {len(csv_manager.handled_set)} 条历史记录")
+
+    logger.info("清理服务端残留文件...")
+    cleanup_client = make_client(config)
+    removed = cleanup_uploaded_files(cleanup_client)
+    if removed:
+        logger.info(f"已清理 {removed} 个残留文件")
+
+    max_workers = getattr(config, "max_workers", 4)
+    logger.info(f"启动线程池，max_workers={max_workers}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_single_task,
+                pdf_file,
+                i,
+                total,
+                config,
+                prompt,
+                csv_manager,
+                counters,
+                skip_existing,
+                stop_event,
+            ): pdf_file
+            for i, pdf_file in enumerate(pdf_files, 1)
+        }
+
+        for future in as_completed(futures):
+            pdf_file = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"线程异常 [{pdf_file.name}]: {e}", exc_info=True)
+                stop_event.set()  
+
+    processed = total - counters.skipped
+    logger.info(
+        f"处理完成 | 总计: {total} | 跳过: {counters.skipped} | "
+        f"实际处理: {processed} | "
+        f"有数据: {counters.has_data} | 无数据: {counters.no_data} | "
+        f"失败: {counters.failed}"
+    )
+    logger.info(f"CSV 路径: {csv_path}")
+
+
+def process_pdf_single_file(config: MainScreeningConfig, pdf_path: str):
+
+    if not os.path.exists(pdf_path):
+        logger.error(f"文件不存在: {pdf_path}")
+        return "处理失败", "文件不存在"
+
+    client = make_client(config)
+    prompt = load_prompt_template(config.prompt_templates_path)
+    if not prompt:
+        logger.error("prompt 模板为空，终止处理")
+        return "处理失败", "prompt 模板为空"
+
+    file_id = None
+    try:
+        file_id = upload_file(client, pdf_path)
+        wait_file_processed(client, file_id)
+        result = run_workflow(client, file_id, prompt, config)
+        if not result:
+            return "处理失败", "工作流执行失败"
+
+        result = clean_response_text(result)
+        logger.debug(f"提取结果: {result[:200]}")
+
+        return ("无", "无相关数据") if is_no_data(result) else ("有", "有相关数据")
+
+    except Exception as e:
+        logger.error(f"处理异常: {e}", exc_info=True)
+        return "处理失败", f"错误: {e}"
+    finally:
+        if file_id:
+            delete_file(client, file_id)
